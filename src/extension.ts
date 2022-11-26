@@ -2,13 +2,14 @@
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import { exec } from 'node:child_process';
-import { writeFile } from 'node:fs';
+import { unlink, stat, writeFile, existsSync } from 'node:fs';
 
 class ASTNode {
 	name: string = "";
 	type: string = "";
 	text: string = "";
 	attr: string = "";
+	dataType: string = "";
 	nodes: ASTNode[] = [];
 };
 
@@ -31,10 +32,14 @@ function recursiveASTNode(text: [number, string][]): ASTNode {
 			node.type = node.text.substring(0, node.text.indexOf(' '));
 
 			if (node.type === varDecl) {
-				let striped = node.text.replace(" used", "").substring(node.text.indexOf(">") + 2, node.text.length);
+				let striped = node.text.replace(" invalid", "").replace(" used", "").substring(node.text.indexOf(">") + 2, node.text.length);
 				striped = striped.substring(striped.indexOf(" ") + 1, striped.length);
 				striped = striped.substring(0, striped.indexOf(" "));
 				node.name = striped;
+				node.dataType = node.text.substring(node.text.indexOf(node.name) + node.name.length + 2, node.text.length);
+				node.dataType = node.dataType.substring(0, node.dataType.indexOf("'"));
+				let splited = node.dataType.split(" ");
+				node.dataType = splited[splited.length - 1];
 			}
 
 			if (node.type === functionDecl) {
@@ -132,12 +137,14 @@ ${csKernels}
 
 let extensionPath = "";
 
-async function dxCompile(filePath: string, workingPath: string): Promise<ASTNode> {
+async function dxCompile(filePath: string, profile: string, workingPath?: string, includes?: string[]): Promise<ASTNode> {
 	let exe = `\"${extensionPath}/dxcompiler/dxc.exe\"`;
-	let p = `-T cs_6_0 -ast-dump \"${filePath}\"`;
+	let include = ``;
+	if (includes && includes.length !== 0) {
+		include = ` -I ${includes.map(x => `\"${x}\"`).join(" ")}`;
+	}
 
-	// var include = `Packages/`;
-	// var p = `-T cs_6_0 -E AllocateIndexForObejct -I ${include} -ast-dump ${filePath}`;
+	let p = `-T ${profile}_6_0${include} -ast-dump \"${filePath}\"`;
 
 	return new Promise((resolve, _) => {
 		exec(`${exe} ${p}`, { cwd: workingPath, maxBuffer: 1024 * 1024 * 5 }, (_, stdout, __) => {
@@ -146,14 +153,111 @@ async function dxCompile(filePath: string, workingPath: string): Promise<ASTNode
 	});
 }
 
+function getMatchedWordsCount(textToMatch: string, pattern: string[]): number {
+	return pattern.filter(x => textToMatch.includes(x)).length;
+}
+
+function mapPropertyType(type: string): [string, string] {
+	type = type.replace("half", "float").replace("fixed", "float");
+
+	//	match, type in property block, default value
+	let matchTypes: Array<[string[], string, string]> = [];
+
+	matchTypes.push([["int", "uint"], `Integer`, `1`]);
+	matchTypes.push([["float", "double"], `Float`, `1`]);
+	matchTypes.push([["sampler", "sampler2D", "Texture2D"], `2D`, `"white" {}`]);
+	matchTypes.push([["Texture2DArray"], `2DArray`, `"" {}`]);
+	matchTypes.push([["sampler2D", "Texture3D"], `3D`, `"" {}`]);
+	matchTypes.push([["samplerCUBE", "TextureCube"], `Cube`, `"" {}`]);
+	matchTypes.push([["TextureCubeArray"], `CubeArray`, `"" {}`]);
+	matchTypes.push([["float2", "float3", "float4"], `Vector`, `(1, 1, 1, 1)`]);
+
+	for (let i = 0; i < matchTypes.length; i++) {
+		let match = matchTypes[i];
+		if (match[0].includes(type)) {
+			return [match[1], match[2]];
+		}
+	}
+	return [" ", " "];
+}
+
+function insertVariableToProperty(name: string, type: string, text: string, activeTextEditor: vscode.TextEditor) {
+	let indexOfProperties = text.indexOf("Properties");
+	let indexOfLeftBracket = text.indexOf("{", indexOfProperties);
+	let blockSameLineWithProperties = text.substring(indexOfProperties, indexOfLeftBracket + 1).includes("\n");
+	let lines = text.split('\n');
+	let insertLineNumber = 0;
+	for (let i = 0; i < lines.length; i++) {
+		let line = lines[i];
+		if (line.includes("Properties")) {
+			insertLineNumber = i;
+			break;
+		}
+	}
+	insertLineNumber++;
+	if (!blockSameLineWithProperties) { insertLineNumber++; }
+	let map = mapPropertyType(type);
+
+	let namePlaceholder = `$\{1:${name}}`;
+	let propertyPlaceholder = `$\{2:${name}}`;
+	let typePlaceholder = `$\{3:${map[0]}}`;
+	let defaultValuePlaceholder = `$\{4:${map[1]}}`;
+
+	let snippetString = `\n${namePlaceholder}("${propertyPlaceholder}", ${typePlaceholder}) = ${defaultValuePlaceholder}`;
+	activeTextEditor.insertSnippet(new vscode.SnippetString(snippetString), new vscode.Position(insertLineNumber - 2, snippetString.length));
+}
+
 async function addVariableToProperties() {
-	let filePath = vscode.window.activeTextEditor?.document?.uri?.fsPath;
+	let activeTextEditor = vscode.window.activeTextEditor;
+	if (!activeTextEditor) { return; }
+	let filePath = activeTextEditor.document?.uri?.fsPath;
 	if (!filePath) { return; }
 
-	let lineCode = vscode.window.activeTextEditor?.selection.active.line;
+	let lineCode = activeTextEditor.selection.active.line;
 	if (!lineCode) { return; }
 	lineCode++;
 
+	let text = activeTextEditor.document.getText();
+	let line = activeTextEditor.document.lineAt(lineCode - 1);
+	if (!text) { return; }
+	if (!line || typeof (line) === undefined) { return; }
+	let indexOfLine = text?.indexOf(line.text);
+	let indexOfCGPROGRAM = text.substring(0, indexOfLine).lastIndexOf("CGPROGRAM");
+	let indexOfENDCG = text.substring(indexOfLine, text.length).indexOf("ENDCG") + indexOfLine;
+
+	let shaderBody = text.substring(indexOfCGPROGRAM + 11, indexOfENDCG);
+	let tempFilePath = "e:/shader.hlsl";
+	let lineIndexInShaderBody = shaderBody.indexOf(line.text) + line.text.length;
+	lineIndexInShaderBody = shaderBody.substring(0, lineIndexInShaderBody).split('\n').length;
+	writeFile(tempFilePath, shaderBody, () => { });
+	let includes: string[] = [];
+	if (vscode.workspace.workspaceFolders !== undefined) {
+		let worksapce = vscode.workspace.workspaceFolders[0].uri.fsPath;
+		includes.push(worksapce);
+	}
+
+	let node = await dxCompile(tempFilePath, "ps", undefined, includes);
+	let matchCount = 0;
+	let matchLineText = `<line:${lineIndexInShaderBody}`;
+	let varible = node.nodes
+		.filter(x => x.type === varDecl)
+		.filter(x => x.text.includes(matchLineText))
+		.sort((a, b) => {
+			let aMatch = getMatchedWordsCount(a.text, line!.text.split(" "));
+			let bMatch = getMatchedWordsCount(b.text, line!.text.split(" "));
+			matchCount = Math.max(matchCount, aMatch, bMatch);
+			return aMatch > bMatch ? 1 : -1;
+		});
+	if (!varible || varible.length === 0 || (matchCount === 0 && varible.length > 1)) {
+		vscode.window.showInformationMessage("Variable not used or there is compile error.");
+		return;
+	}
+	let selectedVarible = varible[0];
+	insertVariableToProperty(selectedVarible.name, selectedVarible.dataType, text, activeTextEditor);
+	// vscode.window.showInformationMessage(varible[0].dataType);
+	if (existsSync(tempFilePath)) {
+		unlink(tempFilePath, () => { });
+	}
 }
 
 async function generateHLSLVariables() {
@@ -168,7 +272,7 @@ async function generateHLSLVariables() {
 		realFilePath = filePath.replace(`${realWorkingPath}\\`, "");
 	}
 
-	let node = await dxCompile(realFilePath, realWorkingPath);
+	let node = await dxCompile(realFilePath, "cs", realWorkingPath);
 	let ast = getVariableAndKernelNodeFromASTTree(node);
 	let cs = fillCSharpCode(realFilePath.replace(/^.*[\\\/]/, '').split(".")[0], ast[0].map(x => x.name), ast[1].map(x => x.name));
 	let csPath = `${filePath.substring(0, filePath.lastIndexOf('.'))}.cs`;
