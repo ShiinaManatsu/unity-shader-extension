@@ -182,7 +182,7 @@ function mapPropertyType(type: string): [string, string] {
 }
 
 function getPropertyBlock(indexStart: number, text: string): string {
-	let regex = /{\W*}/gim;
+	let regex = /{\W*}/gm;
 	let match = [...text.matchAll(regex)].map(x => x[0]);
 	match.forEach(x => {
 		text = text.replace(x, "");
@@ -201,37 +201,22 @@ function insertVariableToProperty(name: string, type: string, text: string, acti
 	if (propertyBlockExist) {
 		let indexOfProperties = text.indexOf("Properties");
 		let indexOfLeftBracket = text.indexOf("{", indexOfProperties);
-
+		let indexOfRightBracket = text.indexOf("}", indexOfLeftBracket);
 
 		if (propertyBlockExist && isPropertyExist(name, getPropertyBlock(indexOfLeftBracket, text))) {
 			vscode.window.showInformationMessage(`Looks like variable ${name} has been defined in properties`);
 			return;
 		}
-		let blockSameLineWithProperties = text.substring(indexOfProperties, indexOfLeftBracket + 1).includes("\n");
-		let lines = text.split('\n');
-		for (let i = 0; i < lines.length; i++) {
-			let line = lines[i];
-			if (line.includes("Properties")) {
-				insertLineNumber = i;
-				break;
-			}
-		}
-		insertLineNumber++;
-		if (!blockSameLineWithProperties) { insertLineNumber++; }
+
+		insertLineNumber = text.substring(0, indexOfRightBracket).split("\n").length - 1;
 	}
 	else {
-		let shaderSubshaderReg = /(Shader)(.|\n)*(SubShader)/gim;
-		let shaderHeaderReg = /(Shader)\W*".*"\W*{/gim;
-		
-		let match = shaderSubshaderReg.exec(text);
+		let shaderHeaderReg = new RegExp("Shader(\\s|\\n|\\t|\\r)*\".*\"(\\s|\\n|\\t|\\r)*{", "gm");
+
+		let match = shaderHeaderReg.exec(text);
 		if (match !== null) {
 			insertLineNumber = match.index;
-		}
-		else {
-			match = shaderHeaderReg.exec(text);
-			if (match !== null) {
-				insertLineNumber = match.index;
-			}
+			insertLineNumber = text.substring(0, insertLineNumber + match[0].length).split("\n").length;
 		}
 	}
 	let map = mapPropertyType(type);
@@ -241,8 +226,16 @@ function insertVariableToProperty(name: string, type: string, text: string, acti
 	let typePlaceholder = `$\{3:${map[0]}}`;
 	let defaultValuePlaceholder = `$\{4:${map[1]}}`;
 
-	let snippetString = `\n${namePlaceholder}("${propertyPlaceholder}", ${typePlaceholder}) = ${defaultValuePlaceholder}`;
-	activeTextEditor.insertSnippet(new vscode.SnippetString(snippetString), new vscode.Position(insertLineNumber - 2, snippetString.length));
+	let snippetString = `		${namePlaceholder}("${propertyPlaceholder}", ${typePlaceholder}) = ${defaultValuePlaceholder}${propertyBlockExist ? "\n" : ""}`;
+
+	if (!propertyBlockExist) {
+		snippetString = `	Properties{
+${snippetString}
+	}
+`;
+	}
+
+	activeTextEditor.insertSnippet(new vscode.SnippetString(snippetString), new vscode.Position(insertLineNumber, 0));
 }
 
 function isPropertyBlockExist(text: string): boolean {
@@ -250,7 +243,7 @@ function isPropertyBlockExist(text: string): boolean {
 }
 
 function isPropertyExist(name: string, text: string): boolean {
-	let regex = new RegExp(`(${name})\\W*\\(`, "gim");
+	let regex = new RegExp(`(${name})\\W*\\(`, "gm");
 	return text.match(regex) !== null;
 }
 
@@ -281,7 +274,7 @@ async function addVariableToPropertiesPlainText() {
 	let name = match[0];
 	let type = match[1];
 
-	insertVariableToProperty(name, type, text, activeTextEditor);
+	insertVariableToProperty(name, type, activeTextEditor.document.getText(), activeTextEditor);
 }
 
 async function addVariableToPropertiesAST(): Promise<boolean> {
