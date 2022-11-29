@@ -2,7 +2,7 @@
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import { exec } from 'node:child_process';
-import { unlink, stat, writeFile, existsSync } from 'node:fs';
+import { unlink, stat, writeFile, existsSync, writeFileSync } from 'node:fs';
 
 class ASTNode {
 	name: string = "";
@@ -181,21 +181,59 @@ function mapPropertyType(type: string): [string, string] {
 	return [" ", " "];
 }
 
+function getPropertyBlock(indexStart: number, text: string): string {
+	let regex = /{\W*}/gim;
+	let match = [...text.matchAll(regex)].map(x => x[0]);
+	match.forEach(x => {
+		text = text.replace(x, "");
+	});
+	let indexOfRightBracket = text.indexOf("}", indexStart + 2);
+	return text.substring(indexStart, indexOfRightBracket);
+}
+
 function insertVariableToProperty(name: string, type: string, text: string, activeTextEditor: vscode.TextEditor) {
-	let indexOfProperties = text.indexOf("Properties");
-	let indexOfLeftBracket = text.indexOf("{", indexOfProperties);
-	let blockSameLineWithProperties = text.substring(indexOfProperties, indexOfLeftBracket + 1).includes("\n");
-	let lines = text.split('\n');
+	let propertyBlockExist = isPropertyBlockExist(text);
+
 	let insertLineNumber = 0;
-	for (let i = 0; i < lines.length; i++) {
-		let line = lines[i];
-		if (line.includes("Properties")) {
-			insertLineNumber = i;
-			break;
+	if (propertyBlockExist) {
+	}
+
+	if (propertyBlockExist) {
+		let indexOfProperties = text.indexOf("Properties");
+		let indexOfLeftBracket = text.indexOf("{", indexOfProperties);
+
+
+		if (propertyBlockExist && isPropertyExist(name, getPropertyBlock(indexOfLeftBracket, text))) {
+			vscode.window.showInformationMessage(`Looks like variable ${name} has been defined in properties`);
+			return;
+		}
+		let blockSameLineWithProperties = text.substring(indexOfProperties, indexOfLeftBracket + 1).includes("\n");
+		let lines = text.split('\n');
+		for (let i = 0; i < lines.length; i++) {
+			let line = lines[i];
+			if (line.includes("Properties")) {
+				insertLineNumber = i;
+				break;
+			}
+		}
+		insertLineNumber++;
+		if (!blockSameLineWithProperties) { insertLineNumber++; }
+	}
+	else {
+		let shaderSubshaderReg = /(Shader)(.|\n)*(SubShader)/gim;
+		let shaderHeaderReg = /(Shader)\W*".*"\W*{/gim;
+		
+		let match = shaderSubshaderReg.exec(text);
+		if (match !== null) {
+			insertLineNumber = match.index;
+		}
+		else {
+			match = shaderHeaderReg.exec(text);
+			if (match !== null) {
+				insertLineNumber = match.index;
+			}
 		}
 	}
-	insertLineNumber++;
-	if (!blockSameLineWithProperties) { insertLineNumber++; }
 	let map = mapPropertyType(type);
 
 	let namePlaceholder = `$\{1:${name}}`;
@@ -207,7 +245,16 @@ function insertVariableToProperty(name: string, type: string, text: string, acti
 	activeTextEditor.insertSnippet(new vscode.SnippetString(snippetString), new vscode.Position(insertLineNumber - 2, snippetString.length));
 }
 
-async function addVariableToProperties() {
+function isPropertyBlockExist(text: string): boolean {
+	return text.match(/\{\W*Properties\W*{/gm) !== null;
+}
+
+function isPropertyExist(name: string, text: string): boolean {
+	let regex = new RegExp(`(${name})\\W*\\(`, "gim");
+	return text.match(regex) !== null;
+}
+
+async function addVariableToPropertiesPlainText() {
 	let activeTextEditor = vscode.window.activeTextEditor;
 	if (!activeTextEditor) { return; }
 	let filePath = activeTextEditor.document?.uri?.fsPath;
@@ -217,19 +264,50 @@ async function addVariableToProperties() {
 	if (!lineCode) { return; }
 	lineCode++;
 
+	let line = activeTextEditor.document.lineAt(lineCode - 1);
+	if (!line || typeof (line) === undefined) { return; }
+
+	let text = line.text;
+	if (text.includes("//")) { text = text.substring(0, text.indexOf("//")); }
+	if (text.includes("=")) { text = `${text.substring(0, text.indexOf("="))};`; }
+	text = text.trim();
+	text = text.replace(";", "");
+
+	const regex = new RegExp("\\w*", "g");
+
+	let match = [...text.matchAll(regex)].map(x => x[0]).filter(x => x.length > 0).reverse();
+
+	if (match.length < 2) { return; }
+	let name = match[0];
+	let type = match[1];
+
+	insertVariableToProperty(name, type, text, activeTextEditor);
+}
+
+async function addVariableToPropertiesAST(): Promise<boolean> {
+	let activeTextEditor = vscode.window.activeTextEditor;
+	if (!activeTextEditor) { return false; }
+	let filePath = activeTextEditor.document?.uri?.fsPath;
+	if (!filePath) { return false; }
+
+	let lineCode = activeTextEditor.selection.active.line;
+	if (!lineCode) { return false; }
+	lineCode++;
+
 	let text = activeTextEditor.document.getText();
 	let line = activeTextEditor.document.lineAt(lineCode - 1);
-	if (!text) { return; }
-	if (!line || typeof (line) === undefined) { return; }
+	if (!text) { return false; }
+	if (!line || typeof (line) === undefined) { return false; }
 	let indexOfLine = text?.indexOf(line.text);
 	let indexOfCGPROGRAM = text.substring(0, indexOfLine).lastIndexOf("CGPROGRAM");
 	let indexOfENDCG = text.substring(indexOfLine, text.length).indexOf("ENDCG") + indexOfLine;
 
 	let shaderBody = text.substring(indexOfCGPROGRAM + 11, indexOfENDCG);
-	let tempFilePath = "e:/shader.hlsl";
+
+	let tempFilePath = `${extensionPath}\\temp.hlsl`;
 	let lineIndexInShaderBody = shaderBody.indexOf(line.text) + line.text.length;
 	lineIndexInShaderBody = shaderBody.substring(0, lineIndexInShaderBody).split('\n').length;
-	writeFile(tempFilePath, shaderBody, () => { });
+	writeFileSync(tempFilePath, shaderBody);
 	let includes: string[] = [];
 	if (vscode.workspace.workspaceFolders !== undefined) {
 		let worksapce = vscode.workspace.workspaceFolders[0].uri.fsPath;
@@ -237,6 +315,7 @@ async function addVariableToProperties() {
 	}
 
 	let node = await dxCompile(tempFilePath, "ps", undefined, includes);
+	if (existsSync(tempFilePath)) { unlink(tempFilePath, () => { }); }
 	let matchCount = 0;
 	let matchLineText = `<line:${lineIndexInShaderBody}`;
 	let varible = node.nodes
@@ -249,14 +328,22 @@ async function addVariableToProperties() {
 			return aMatch > bMatch ? 1 : -1;
 		});
 	if (!varible || varible.length === 0 || (matchCount === 0 && varible.length > 1)) {
-		vscode.window.showInformationMessage("Variable not used or there is compile error.");
-		return;
+		// vscode.window.showInformationMessage("Variable not used or there is compile error.");
+		return false;
 	}
 	let selectedVarible = varible[0];
+
+
+
 	insertVariableToProperty(selectedVarible.name, selectedVarible.dataType, text, activeTextEditor);
 	// vscode.window.showInformationMessage(varible[0].dataType);
-	if (existsSync(tempFilePath)) {
-		unlink(tempFilePath, () => { });
+	return true;
+}
+
+async function addVariableToProperties() {
+	let ret = await addVariableToPropertiesAST();
+	if (!ret) {
+		addVariableToPropertiesPlainText();
 	}
 }
 

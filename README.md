@@ -26,4 +26,4 @@ public class Example : MonoBehavior
 
 Add variable as property to Unity shader's property block so you don't need to scroll up to top.
 
-`Not yet implemented.`
+Right click on the variable you want to add to property block, select `Add To Property`.
